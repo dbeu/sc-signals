@@ -575,7 +575,7 @@ def run_loop(args: argparse.Namespace) -> None:
         sleep_until_next_poll(args.poll_seconds)
 
 
-def run_daemon(args: argparse.Namespace) -> None:
+def run_forever(args: argparse.Namespace) -> None:
     original_date = args.date
     while True:
         now_et = pd.Timestamp.now(tz=ET)
@@ -713,8 +713,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d2-prev-high-open-min", type=float, default=0.20)
     parser.add_argument("--post-url", default="", help="Optional receiver URL, e.g. http://1.2.3.4:8080/events.")
     parser.add_argument("--post-token", default="")
-    parser.add_argument("--loop", action="store_true", help="Run the production polling loop instead of a one-shot seed fetch.")
-    parser.add_argument("--daemon", action="store_true", help="Keep running across days. Requires --loop.")
+    parser.add_argument("--loop", action="store_true", help="Run the production multi-day polling loop instead of a one-shot seed fetch.")
+    parser.add_argument("--single-day", action="store_true", help="With --loop, run one trade date and exit after the stop time.")
     parser.add_argument("--start-time", default="09:20:00")
     parser.add_argument("--stop-time", default="14:05:00")
     parser.add_argument("--poll-seconds", type=int, default=60)
@@ -732,12 +732,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.daemon:
-        if not args.loop:
-            raise SystemExit("--daemon requires --loop")
-        run_daemon(args)
-    elif args.loop:
-        run_loop(args)
+    if args.loop:
+        if args.single_day:
+            run_loop(args)
+        else:
+            run_forever(args)
     else:
         args.func(args)
 
