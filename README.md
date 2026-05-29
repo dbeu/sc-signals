@@ -301,3 +301,54 @@ Known replay checks:
 - On the first live day, watch logs from `09:20` through at least `09:35 ET`.
 - Live v1 is signal-only. Manual trade review/execution remains outside this
   repo.
+
+## Deployment Record
+
+Recorded on 2026-05-29.
+
+Current deployed repo state:
+
+```text
+1c0b31c Harden Stage 2 HTTP responses
+85592db Log Stage 2 request IPs
+87d083f Document live v1 runbook
+```
+
+What is live:
+
+- Stage 2 is running on VPS `45.76.19.162` as `sc-signals.service`.
+- Stage 2 accepts Stage 1 events at `http://45.76.19.162:8080/events`.
+- Stage 2 sends Discord signal alerts.
+- Stage 2 writes event archives to `/opt/sc_stage2_inbox`.
+- Stage 2 writes signal files to `/opt/sc_stage2_signals`.
+- Stage 2 writes request/IP logs to `/opt/sc_stage2_access.jsonl`.
+- Public `/health` returns only `{"ok": true}`.
+- Detailed `/health` requires the Stage 1 bearer token.
+- `/events` requires the Stage 1 bearer token.
+- Bad or unauthorized requests are logged and repeated bad `/events` requests
+  from the same IP are rate-limited.
+- Stage 2 stale-data Discord alerts are enabled during `09:20-14:05 ET`.
+- SSH key login has been tested.
+- SSH password login is disabled.
+- Root SSH login is key-only.
+- Local SSH alias `sc-signals` connects to the VPS.
+
+Verified checks:
+
+```text
+ssh sc-signals -> key login OK
+password-only SSH -> rejected with publickey-only auth
+systemctl is-active sc-signals -> active
+public /health -> 200 with only {"ok": true}
+unauthorized /events -> 401
+unsupported HTTP method -> 405
+```
+
+Known remaining non-blockers:
+
+- Stage 1 posts over HTTP, not HTTPS. Keep `SC_STAGE1_TOKEN` private and rotate
+  it if it may have leaked.
+- Stage 1 runs manually from the local machine. If it crashes, restart it
+  manually; Stage 2 will alert when data goes stale.
+- Ubuntu security updates were pending during setup and should be applied during
+  a maintenance window.
