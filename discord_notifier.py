@@ -71,8 +71,7 @@ def format_signal_line(signal: dict[str, Any]) -> str:
 def format_signal_message(signals: list[dict[str, Any]]) -> str:
     if not signals:
         return ""
-    asof = signals[-1].get("generated_at_et", "")
-    lines = [f"**SC Signals** [{asof}]", ""]
+    lines: list[str] = []
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for signal in signals:
         grouped[str(signal.get("strategy", "")).upper()].append(signal)
