@@ -94,5 +94,6 @@ def scalars(day_cache: dict[str, pd.DataFrame], date: str) -> dict[str, float | 
         "allh_time": str(all_high_row["tod"]),
         "pmh": float(pm["high"].max()) if not pm.empty else np.nan,
         "pmc": float(pm.iloc[-1]["close"]) if not pm.empty else np.nan,
+        "pm_volume": float(pm["volume"].sum()) if not pm.empty else np.nan,
         "ahh": float(ah["high"].max()) if not ah.empty else np.nan,
     }

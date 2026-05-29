@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Dependency-free Stage 2 event receiver.
+"""Stage 2 event receiver.
 
-This is intentionally small: it accepts Stage 1 event directories, writes them
-to an inbox, and returns a receipt. It does not compute signals yet.
+It accepts Stage 1 event directories, writes them to an inbox, processes them
+with the signal engine, and optionally sends Discord notifications.
 """
 
 from __future__ import annotations
@@ -17,6 +17,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from common import DEFAULT_PARAM_CSV
+from discord_notifier import DiscordNotifier, send_signal_notifications
+from env_loader import load_dotenv
+from stage2_signal_engine import SignalState, load_params, process_event_dir, save_signals
+
 
 ALLOWED_FILES = {
     "manifest.json",
@@ -29,7 +34,10 @@ MAX_BODY_BYTES = 100 * 1024 * 1024
 
 class ReceiverConfig:
     inbox_dir: Path
+    signals_dir: Path
     token: str
+    signal_state: SignalState
+    discord: DiscordNotifier | None
 
 
 def safe_name(value: str) -> str:
@@ -74,7 +82,10 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "stage2_event_receiver",
                 "inbox_dir": str(ReceiverConfig.inbox_dir),
+                "signals_dir": str(ReceiverConfig.signals_dir),
                 "auth_enabled": bool(ReceiverConfig.token),
+                "discord_enabled": ReceiverConfig.discord is not None,
+                "signals_generated": len(ReceiverConfig.signal_state.signals),
             },
         )
 
@@ -96,6 +107,12 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
             receipt = self.save_event(payload)
+            new_signals = process_event_dir(ReceiverConfig.signal_state, Path(receipt["event_dir"]))
+            save_signals(ReceiverConfig.signal_state, ReceiverConfig.signals_dir)
+            send_signal_notifications(ReceiverConfig.discord, new_signals)
+            receipt["new_signals"] = len(new_signals)
+            receipt["signals_total"] = len(ReceiverConfig.signal_state.signals)
+            (Path(receipt["event_dir"]) / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
         except Exception as exc:
             json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             return
@@ -145,22 +162,38 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--env", type=Path, default=Path(".env"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--inbox-dir", type=Path, default=Path("stage2_inbox"))
+    parser.add_argument("--signals-dir", type=Path, default=Path("stage2_signals"))
+    parser.add_argument("--param-csv", type=Path, default=DEFAULT_PARAM_CSV)
     parser.add_argument("--token", default=os.environ.get("SC_STAGE1_TOKEN", ""))
+    parser.add_argument("--no-discord", action="store_true")
+    parser.add_argument("--dry-run-discord", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    load_dotenv(args.env)
+    if not args.token:
+        args.token = os.environ.get("SC_STAGE1_TOKEN", "")
     ReceiverConfig.inbox_dir = args.inbox_dir.resolve()
     ReceiverConfig.inbox_dir.mkdir(parents=True, exist_ok=True)
+    ReceiverConfig.signals_dir = args.signals_dir.resolve()
+    ReceiverConfig.signals_dir.mkdir(parents=True, exist_ok=True)
     ReceiverConfig.token = args.token
+    ReceiverConfig.signal_state = SignalState(load_params(args.param_csv))
+    ReceiverConfig.discord = None if args.no_discord else DiscordNotifier.from_env(dry_run=args.dry_run_discord)
 
     server = ThreadingHTTPServer((args.host, args.port), Stage2EventHandler)
     print(
-        f"Listening on http://{args.host}:{args.port} inbox={ReceiverConfig.inbox_dir} auth={bool(args.token)}",
+        (
+            f"Listening on http://{args.host}:{args.port} "
+            f"inbox={ReceiverConfig.inbox_dir} signals={ReceiverConfig.signals_dir} "
+            f"auth={bool(args.token)} discord={ReceiverConfig.discord is not None}"
+        ),
         flush=True,
     )
     server.serve_forever()

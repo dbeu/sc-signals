@@ -106,6 +106,8 @@ class SignalState:
         gap = safe_ratio(day_open, prev_close)
         pm_selloff = safe_ratio(day_open, pm_high)
         pm_high_ext = safe_ratio(pm_high, prev_close)
+        if "GO" in self.params:
+            self._process_go(ticker, date, gap, pm_selloff, today_scalars, day_cache, asof_et)
         ge = self.params["GE"]
         if (
             pd.notna(pm_high_ext)
@@ -127,6 +129,55 @@ class SignalState:
             return
         self._process_d2o(ticker, date, d2_context, day_cache, asof_et)
         self._process_re_like(ticker, date, "D2E", d2_context, day_cache, asof_et)
+
+    def _process_go(
+        self,
+        ticker: str,
+        date: str,
+        gap: float,
+        pm_selloff: float,
+        today_scalars: dict,
+        day_cache: dict[str, pd.DataFrame],
+        asof_et: pd.Timestamp,
+    ) -> None:
+        params = self.params["GO"]
+        pm_volume = float(today_scalars.get("pm_volume", np.nan))
+        day_open = float(today_scalars["o"])
+        pm_dollar_volume = day_open * pm_volume if pd.notna(pm_volume) else np.nan
+        if not (
+            pd.notna(gap)
+            and pd.notna(pm_selloff)
+            and pd.notna(pm_dollar_volume)
+            and gap >= float(params["go_gap_min"])
+            and gap < float(params["go_gap_max"])
+            and pm_selloff >= float(params["go_selloff_min"])
+            and pm_selloff < float(params["go_selloff_max"])
+            and pm_dollar_volume >= float(params.get("go_min_pm_dollar_volume", 200_000.0))
+        ):
+            return
+        rth = session(day_cache, date, RTH_START, RTH_END)
+        if rth.empty:
+            return
+        first = rth.iloc[0]
+        if pd.Timestamp(first["dt"]) > asof_et:
+            return
+        entry = float(first["open"])
+        if not MIN_ENTRY_PRICE <= entry <= MAX_ENTRY_PRICE:
+            return
+        self._add_signal(
+            {
+                "strategy": "GO",
+                "ticker": ticker,
+                "date": date,
+                "time": RTH_START,
+                "time_bucket_1h": time_bucket_1h(RTH_START),
+                "gap": gap,
+                "selloff": pm_selloff,
+                "pm_dollar_volume": pm_dollar_volume,
+                "entry_price": entry,
+                "generated_at_et": asof_et.isoformat(),
+            }
+        )
 
     def _d2_context(self, prev_scalars: dict, today_scalars: dict) -> dict | None:
         context = {
@@ -259,28 +310,43 @@ def event_dirs(events_dir: Path) -> list[Path]:
     return sorted(path for path in events_dir.iterdir() if path.is_dir())
 
 
-def run(args: argparse.Namespace) -> None:
-    state = SignalState(load_params(args.param_csv))
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    for cycle in event_dirs(args.events_dir):
-        manifest_path = cycle / "manifest.json"
-        if not manifest_path.exists():
-            continue
-        manifest = json.loads(manifest_path.read_text())
-        asof_et = pd.Timestamp(manifest["asof_et"])
-        context_path = cycle / "universe_context.parquet"
-        bars_path = cycle / "bar_delta.parquet"
-        if context_path.exists():
-            state.ingest_context(pd.read_parquet(context_path))
-        if bars_path.exists():
-            state.ingest_bars(pd.read_parquet(bars_path))
-        state.process(asof_et)
+def process_event_dir(state: SignalState, event_dir: Path) -> list[dict]:
+    manifest_path = event_dir / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    before = len(state.signals)
+    manifest = json.loads(manifest_path.read_text())
+    asof_et = pd.Timestamp(manifest["asof_et"])
+    context_path = event_dir / "universe_context.parquet"
+    bars_path = event_dir / "bar_delta.parquet"
+    if context_path.exists():
+        state.ingest_context(pd.read_parquet(context_path))
+    if bars_path.exists():
+        state.ingest_bars(pd.read_parquet(bars_path))
+    state.process(asof_et)
+    return state.signals[before:]
 
+
+def signals_frame(state: SignalState) -> pd.DataFrame:
     signals = pd.DataFrame(state.signals)
     if not signals.empty:
         signals = signals.sort_values(["date", "time", "strategy", "ticker"]).reset_index(drop=True)
-    signals.to_parquet(args.out_dir / "signals.parquet", index=False)
-    signals.to_csv(args.out_dir / "signals.csv", index=False)
+    return signals
+
+
+def save_signals(state: SignalState, out_dir: Path) -> pd.DataFrame:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    signals = signals_frame(state)
+    signals.to_parquet(out_dir / "signals.parquet", index=False)
+    signals.to_csv(out_dir / "signals.csv", index=False)
+    return signals
+
+
+def run(args: argparse.Namespace) -> None:
+    state = SignalState(load_params(args.param_csv))
+    for cycle in event_dirs(args.events_dir):
+        process_event_dir(state, cycle)
+    signals = save_signals(state, args.out_dir)
     print(f"Saved {len(signals):,} signals to {args.out_dir}")
 
 

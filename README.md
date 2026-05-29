@@ -32,7 +32,8 @@ SC_STAGE1_TOKEN=dev-test-token \
 python3 stage2_event_receiver.py \
   --host 0.0.0.0 \
   --port 8080 \
-  --inbox-dir stage2_inbox
+  --inbox-dir stage2_inbox \
+  --signals-dir stage2_signals
 ```
 
 Health check:
@@ -65,6 +66,17 @@ python3 send_event_dir.py \
   --url http://127.0.0.1:8080/events
 ```
 
+Historical day replay into a running receiver:
+
+```bash
+python3 simulate_replay_day_to_server.py \
+  --date 2026-01-30 \
+  --tickers FEED \
+  --out-dir stage1_events/replay_2026-01-30_feed \
+  --url http://127.0.0.1:8080/events \
+  --clean
+```
+
 ## Run Stage 2 Locally
 
 ```bash
@@ -80,5 +92,10 @@ SC_STAGE1_TOKEN='replace-with-a-long-random-token' \
 python3 stage2_event_receiver.py \
   --host 0.0.0.0 \
   --port 8080 \
-  --inbox-dir /opt/sc_stage2_inbox
+  --inbox-dir /opt/sc_stage2_inbox \
+  --signals-dir /opt/sc_stage2_signals
 ```
+
+If `.env` contains `DISCORD_TOKEN` and `DISCORD_CHANNEL_ID`, the receiver sends
+a Discord batch for every POST that creates new signals. Use
+`--dry-run-discord` to print notification text without sending it.

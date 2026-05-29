@@ -35,6 +35,7 @@ from stage1_polygon_api_probe import (
     fetch_snapshots,
     load_api_key,
 )
+from env_loader import load_dotenv
 from event_transport import post_event_dir
 
 
@@ -276,6 +277,9 @@ def fetch_bars_for_tickers(api_key: str, tickers: list[str], start_date: str, en
 
 
 def run_seed(args: argparse.Namespace) -> None:
+    load_dotenv(args.env)
+    if not args.post_token:
+        args.post_token = os.environ.get("SC_STAGE1_TOKEN", "")
     api_key = load_api_key(args.env)
     trade_date = args.date or datetime.now(ET).date().isoformat()
     prev_date = args.prev_date or previous_weekday(trade_date)
@@ -381,7 +385,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ge-pm-selloff-max", type=float, default=0.0)
     parser.add_argument("--d2-prev-high-open-min", type=float, default=0.20)
     parser.add_argument("--post-url", default="", help="Optional receiver URL, e.g. http://1.2.3.4:8080/events.")
-    parser.add_argument("--post-token", default=os.environ.get("SC_STAGE1_TOKEN", ""))
+    parser.add_argument("--post-token", default="")
     parser.set_defaults(func=run_seed)
     return parser.parse_args()
 
