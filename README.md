@@ -113,8 +113,9 @@ premarket high.
 
 Live v1 Stage 1 should run on market days with this window:
 
-- Start posting: `09:31:00` ET. The 09:30 opening minute is usually available
-  after the minute closes.
+- Start posting: `09:20:00` ET. This gives GO/D2O open-entry strategies
+  pre-open alerts using the latest snapshot/premarket price as an estimated
+  open.
 - Stop posting: `14:05:00` ET. The deployed strategies do not need later data:
   GO/D2O fire at open, GE is morning, RE is midday, and D2E uses the
   `before_1400` window.
@@ -130,7 +131,7 @@ python3 stage1_polygon_fetcher.py \
   --loop \
   --out-dir stage1_events \
   --post-url http://45.76.19.162:8080/events \
-  --start-time 09:31:00 \
+  --start-time 09:20:00 \
   --stop-time 14:05:00 \
   --poll-seconds 60 \
   --reference-limit 0
@@ -140,6 +141,15 @@ python3 stage1_polygon_fetcher.py \
 startup. Stage 1 then polls the all-market snapshot endpoint once per cycle,
 routes likely tickers, fetches minute bars only for routed/active tickers, and
 posts each event cycle to Stage 2.
+
+Open-entry alerts:
+
+- `GO` and `D2O` can alert before the open with `signal_phase=preopen`.
+- The pre-open `entry` is an estimate from the latest snapshot/premarket
+  context.
+- The actual strategy time remains `09:30:00`.
+- Stage 2 de-duplicates by `strategy/ticker/date/time`, so the pre-open alert
+  is not repeated at the open for the same strategy/ticker.
 
 ## Systemd
 

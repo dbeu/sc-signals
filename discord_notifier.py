@@ -56,7 +56,11 @@ def format_signal_line(signal: dict[str, Any]) -> str:
     date = signal.get("date", "")
     time = signal.get("time", "")
     entry = float(signal.get("entry_price", 0.0))
-    parts = [f"**{ticker}**", f"{date} {time}", f"entry ${entry:.2f}"]
+    phase = str(signal.get("signal_phase", "")).strip()
+    parts = [f"**{ticker}**", f"{date} {time}"]
+    if phase:
+        parts.append(phase)
+    parts.append(f"entry ${entry:.2f}")
     if "extension" in signal:
         parts.append(f"ext {float(signal['extension']) * 100:.1f}%")
     if "ema_5_ext" in signal:

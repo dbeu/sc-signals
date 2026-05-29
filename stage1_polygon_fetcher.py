@@ -255,10 +255,14 @@ def build_context(prev_daily: pd.DataFrame, snapshots: pd.DataFrame, trade_date:
         "day_low",
         "day_close",
         "snapshot_price",
+        "estimated_open",
     ]
     for col in cols:
         if col not in context:
             context[col] = pd.NA
+    context["estimated_open"] = pd.to_numeric(context["day_open"], errors="coerce").fillna(
+        pd.to_numeric(context["snapshot_price"], errors="coerce")
+    )
     return context[cols].copy()
 
 
@@ -279,8 +283,8 @@ def route_tickers(context: pd.DataFrame, premarket: pd.DataFrame, thresholds: Ro
     prev_open = pd.to_numeric(routed["prev_open"], errors="coerce")
     prev_high = pd.to_numeric(routed["prev_high"], errors="coerce")
     prev_close = pd.to_numeric(routed["prev_close"], errors="coerce")
-    day_open = pd.to_numeric(routed["day_open"], errors="coerce")
-    day_high = pd.to_numeric(routed["day_high"], errors="coerce")
+    day_open = pd.to_numeric(routed.get("estimated_open", routed["day_open"]), errors="coerce")
+    day_high = pd.to_numeric(routed["day_high"], errors="coerce").fillna(day_open)
     pm_high = pd.to_numeric(routed["pm_high"], errors="coerce")
 
     routed["gap"] = day_open / prev_close - 1.0
@@ -372,8 +376,8 @@ def preliminary_candidates(context: pd.DataFrame, thresholds: RouteThresholds) -
     prev_open = pd.to_numeric(df["prev_open"], errors="coerce")
     prev_high = pd.to_numeric(df["prev_high"], errors="coerce")
     prev_close = pd.to_numeric(df["prev_close"], errors="coerce")
-    day_open = pd.to_numeric(df["day_open"], errors="coerce")
-    day_high = pd.to_numeric(df["day_high"], errors="coerce")
+    day_open = pd.to_numeric(df.get("estimated_open", df["day_open"]), errors="coerce")
+    day_high = pd.to_numeric(df["day_high"], errors="coerce").fillna(day_open)
     df["gap"] = day_open / prev_close - 1.0
     df["high_open"] = day_high / day_open - 1.0
     df["prev_high_open"] = prev_high / prev_open - 1.0
@@ -384,6 +388,36 @@ def preliminary_candidates(context: pd.DataFrame, thresholds: RouteThresholds) -
     )
     price_ok = day_high.ge(MIN_ENTRY_PRICE) & day_open.le(MAX_ENTRY_PRICE).fillna(True)
     return df[possible & price_ok].copy()
+
+
+def event_context_columns(frame: pd.DataFrame) -> list[str]:
+    wanted = [
+        "ticker",
+        "date",
+        "prev_date",
+        "prev_open",
+        "prev_high",
+        "prev_low",
+        "prev_close",
+        "prev_volume",
+        "estimated_open",
+        "day_open",
+        "day_high",
+        "day_low",
+        "day_close",
+        "snapshot_price",
+        "pm_high",
+        "pm_close",
+        "pm_volume",
+        "pm_dollar_volume",
+        "gap",
+        "pm_selloff",
+        "route_go",
+        "route_d2",
+        "route_ge",
+        "route_re",
+    ]
+    return [col for col in wanted if col in frame.columns]
 
 
 def post_cycle(event_dir: Path, post_url: str, post_token: str, source: str) -> None:
@@ -502,11 +536,12 @@ def run_loop(args: argparse.Namespace) -> None:
         bars = pd.concat([prior_bars, active_current], ignore_index=True)
         if not bars.empty:
             bars = bars[bars["tod"].between(PRE_START, AH_END)].copy()
-        event_context = context[context["ticker"].isin(new_tickers)].copy()
+        routed_context = routed.copy()
+        event_context = routed_context[routed_context["ticker"].isin(new_tickers)].copy()
         if cycle_index == 0:
-            event_context = context[context["ticker"].isin(active_tickers)].copy()
+            event_context = routed_context[routed_context["ticker"].isin(active_tickers)].copy()
         if not event_context.empty:
-            event_context = event_context[["ticker", "date", "prev_date", "prev_open", "prev_high", "prev_low", "prev_close", "prev_volume"]]
+            event_context = event_context[event_context_columns(event_context)]
 
         label = "seed" if cycle_index == 0 else now_et.strftime("%H%M")
         event_dir = write_cycle(
@@ -651,7 +686,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--post-url", default="", help="Optional receiver URL, e.g. http://1.2.3.4:8080/events.")
     parser.add_argument("--post-token", default="")
     parser.add_argument("--loop", action="store_true", help="Run the production polling loop instead of a one-shot seed fetch.")
-    parser.add_argument("--start-time", default="09:31:00")
+    parser.add_argument("--start-time", default="09:20:00")
     parser.add_argument("--stop-time", default="14:05:00")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--snapshot-batch-size", type=int, default=500)

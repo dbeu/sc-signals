@@ -84,6 +84,9 @@ class SignalState:
         if pd.notna(prev_date):
             needed_dates.add(str(prev_date))
         day_cache = self._day_cache(ticker, needed_dates)
+        if pd.Timestamp(asof_et).strftime("%H:%M:%S") < RTH_START:
+            self._process_preopen(ticker, date, context_row, day_cache, asof_et)
+            return
         if date not in day_cache:
             return
 
@@ -129,6 +132,135 @@ class SignalState:
             return
         self._process_d2o(ticker, date, d2_context, day_cache, asof_et)
         self._process_re_like(ticker, date, "D2E", d2_context, day_cache, asof_et)
+
+    def _preopen_value(self, context_row: dict, key: str) -> float:
+        value = context_row.get(key, np.nan)
+        return float(value) if pd.notna(value) else np.nan
+
+    def _preopen_pm_context(self, date: str, context_row: dict, day_cache: dict[str, pd.DataFrame]) -> dict:
+        pm_high = self._preopen_value(context_row, "pm_high")
+        pm_close = self._preopen_value(context_row, "pm_close")
+        pm_volume = self._preopen_value(context_row, "pm_volume")
+        today = day_cache.get(date)
+        if today is not None and not today.empty:
+            pm = session(day_cache, date, "04:00:00", RTH_START)
+            if not pm.empty:
+                if pd.isna(pm_high):
+                    pm_high = float(pm["high"].max())
+                if pd.isna(pm_close):
+                    pm_close = float(pm.sort_values("dt").iloc[-1]["close"])
+                if pd.isna(pm_volume):
+                    pm_volume = float(pm["volume"].sum())
+        return {"pmh": pm_high, "pmc": pm_close, "pm_volume": pm_volume}
+
+    def _estimated_open(self, context_row: dict, pm_context: dict) -> float:
+        for key in ("estimated_open", "snapshot_price", "day_open", "pm_close"):
+            value = context_row.get(key, np.nan) if key != "pm_close" else pm_context.get("pmc", np.nan)
+            if pd.notna(value):
+                return float(value)
+        return np.nan
+
+    def _process_preopen(
+        self,
+        ticker: str,
+        date: str,
+        context_row: dict,
+        day_cache: dict[str, pd.DataFrame],
+        asof_et: pd.Timestamp,
+    ) -> None:
+        prev_date = context_row.get("prev_date")
+        pm_context = self._preopen_pm_context(date, context_row, day_cache)
+        estimated_open = self._estimated_open(context_row, pm_context)
+        prev_close = self._preopen_value(context_row, "prev_close")
+        pm_high = float(pm_context["pmh"]) if pd.notna(pm_context.get("pmh")) else np.nan
+        gap = safe_ratio(estimated_open, prev_close)
+        pm_selloff = safe_ratio(estimated_open, pm_high)
+
+        if "GO" in self.params:
+            self._process_go_preopen(ticker, date, gap, pm_selloff, estimated_open, pm_context, asof_et)
+
+        if pd.isna(prev_date) or str(prev_date) not in day_cache:
+            return
+        prev_scalars = scalars(day_cache, str(prev_date))
+        if not prev_scalars:
+            return
+        today_scalars = {
+            "o": estimated_open,
+            "pmh": pm_context["pmh"],
+            "pmc": pm_context["pmc"],
+        }
+        if any(pd.isna(today_scalars[key]) for key in ("o", "pmh", "pmc")):
+            return
+        d2_context = self._d2_context(prev_scalars, today_scalars)
+        if d2_context is not None:
+            self._process_d2o_preopen(ticker, date, estimated_open, d2_context, asof_et)
+
+    def _process_go_preopen(
+        self,
+        ticker: str,
+        date: str,
+        gap: float,
+        pm_selloff: float,
+        estimated_open: float,
+        pm_context: dict,
+        asof_et: pd.Timestamp,
+    ) -> None:
+        params = self.params["GO"]
+        pm_volume = float(pm_context.get("pm_volume", np.nan))
+        pm_dollar_volume = estimated_open * pm_volume if pd.notna(pm_volume) and pd.notna(estimated_open) else np.nan
+        if not (
+            pd.notna(gap)
+            and pd.notna(pm_selloff)
+            and pd.notna(pm_dollar_volume)
+            and gap >= float(params["go_gap_min"])
+            and gap < float(params["go_gap_max"])
+            and pm_selloff >= float(params["go_pm_selloff_ge"])
+            and pm_selloff <= float(params["go_pm_selloff_le"])
+            and pm_dollar_volume >= float(params.get("go_min_pm_dollar_volume", 200_000.0))
+            and MIN_ENTRY_PRICE <= estimated_open <= MAX_ENTRY_PRICE
+        ):
+            return
+        self._add_signal(
+            {
+                "strategy": "GO",
+                "ticker": ticker,
+                "date": date,
+                "time": RTH_START,
+                "time_bucket_1h": time_bucket_1h(RTH_START),
+                "signal_phase": "preopen",
+                "gap": gap,
+                "pm_selloff": pm_selloff,
+                "pm_dollar_volume": pm_dollar_volume,
+                "entry_price": estimated_open,
+                "generated_at_et": asof_et.isoformat(),
+            }
+        )
+
+    def _process_d2o_preopen(
+        self,
+        ticker: str,
+        date: str,
+        estimated_open: float,
+        context: dict,
+        asof_et: pd.Timestamp,
+    ) -> None:
+        if not self._d2_context_passes("D2O", context):
+            return
+        if not MIN_ENTRY_PRICE <= estimated_open <= MAX_ENTRY_PRICE:
+            return
+        self._add_signal(
+            {
+                "strategy": "D2O",
+                "ticker": ticker,
+                "date": date,
+                "time": RTH_START,
+                "time_bucket_1h": time_bucket_1h(RTH_START),
+                "signal_phase": "preopen",
+                **context,
+                "entry_price": estimated_open,
+                "generated_at_et": asof_et.isoformat(),
+            }
+        )
 
     def _process_go(
         self,
