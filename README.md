@@ -146,7 +146,19 @@ Health check:
 curl http://45.76.19.162:8080/health
 ```
 
-Health output includes:
+Public health only returns:
+
+```json
+{"ok": true}
+```
+
+Detailed health requires the Stage 1 bearer token:
+
+```bash
+curl -H "Authorization: Bearer $SC_STAGE1_TOKEN" http://45.76.19.162:8080/health
+```
+
+Detailed health output includes:
 
 - `discord_enabled`
 - `last_event_utc`
@@ -212,6 +224,11 @@ Each access-log line is JSON with the request timestamp, client IP, method,
 path, status, and outcome. Accepted `/events` requests also include event name,
 trade date, bytes received, and number of new signals. Unauthorized requests are
 logged with `outcome="rejected"` and `detail="unauthorized"`.
+
+The receiver also hides detailed health from unauthenticated callers, uses a
+generic HTTP server fingerprint, caps request bodies at 100 MB, rejects unknown
+uploaded file names, and rate-limits repeated bad `/events` requests from the
+same IP.
 
 The service uses:
 

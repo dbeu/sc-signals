@@ -14,6 +14,7 @@ import os
 import shutil
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +36,8 @@ ALLOWED_FILES = {
     "routed_tickers.csv",
 }
 MAX_BODY_BYTES = 100 * 1024 * 1024
+BAD_REQUEST_WINDOW_SECONDS = 60
+MAX_BAD_REQUESTS_PER_WINDOW = 30
 
 
 class ReceiverConfig:
@@ -47,6 +50,8 @@ class ReceiverConfig:
     heartbeat_seconds: int
     access_log: Path
     access_log_lock: threading.Lock
+    bad_request_lock: threading.Lock
+    bad_requests_by_ip: dict[str, deque[float]]
     token: str
     signal_state: SignalState
     discord: DiscordNotifier | None
@@ -70,9 +75,6 @@ def json_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: 
 
 
 def client_ip(handler: BaseHTTPRequestHandler) -> str:
-    forwarded_for = handler.headers.get("X-Forwarded-For", "")
-    if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()
     return handler.client_address[0]
 
 
@@ -105,15 +107,57 @@ def write_access_log(
             file.write(line)
 
 
-def unauthorized(handler: BaseHTTPRequestHandler) -> bool:
+def is_authorized(handler: BaseHTTPRequestHandler) -> bool:
     token = ReceiverConfig.token
     if not token:
-        return False
+        return True
     header = handler.headers.get("Authorization", "")
-    if header == f"Bearer {token}":
+    return header == f"Bearer {token}"
+
+
+def record_bad_request(handler: BaseHTTPRequestHandler) -> None:
+    ip = client_ip(handler)
+    now = time.monotonic()
+    cutoff = now - BAD_REQUEST_WINDOW_SECONDS
+    with ReceiverConfig.bad_request_lock:
+        requests = ReceiverConfig.bad_requests_by_ip.setdefault(ip, deque())
+        while requests and requests[0] < cutoff:
+            requests.popleft()
+        requests.append(now)
+
+
+def bad_request_limited(handler: BaseHTTPRequestHandler) -> bool:
+    ip = client_ip(handler)
+    now = time.monotonic()
+    cutoff = now - BAD_REQUEST_WINDOW_SECONDS
+    with ReceiverConfig.bad_request_lock:
+        requests = ReceiverConfig.bad_requests_by_ip.get(ip)
+        if not requests:
+            return False
+        while requests and requests[0] < cutoff:
+            requests.popleft()
+        return len(requests) >= MAX_BAD_REQUESTS_PER_WINDOW
+
+
+def reject(
+    handler: BaseHTTPRequestHandler,
+    status: HTTPStatus,
+    error: str,
+    detail: str,
+    *,
+    count_bad: bool = True,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    if count_bad:
+        record_bad_request(handler)
+    write_access_log(handler, status, "rejected", detail, extra)
+    json_response(handler, status, {"ok": False, "error": error})
+
+
+def unauthorized(handler: BaseHTTPRequestHandler) -> bool:
+    if is_authorized(handler):
         return False
-    json_response(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
-    write_access_log(handler, HTTPStatus.UNAUTHORIZED, "rejected", "unauthorized")
+    reject(handler, HTTPStatus.UNAUTHORIZED, "unauthorized", "unauthorized")
     return True
 
 
@@ -220,56 +264,63 @@ def check_stage1_heartbeat() -> None:
 
 
 class Stage2EventHandler(BaseHTTPRequestHandler):
-    server_version = "Stage2EventReceiver/0.1"
+    server_version = "SCSignals"
+    sys_version = ""
+
+    def version_string(self) -> str:
+        return self.server_version
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.log_date_time_string()} {self.client_address[0]} {fmt % args}", flush=True)
 
+    def reject_method(self) -> None:
+        reject(self, HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed", "method_not_allowed")
+
+    def do_OPTIONS(self) -> None:
+        self.reject_method()
+
+    def do_PUT(self) -> None:
+        self.reject_method()
+
+    def do_PATCH(self) -> None:
+        self.reject_method()
+
+    def do_DELETE(self) -> None:
+        self.reject_method()
+
     def do_GET(self) -> None:
         if self.path != "/health":
-            write_access_log(self, HTTPStatus.NOT_FOUND, "rejected", "not_found")
-            json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            reject(self, HTTPStatus.NOT_FOUND, "not_found", "not_found")
             return
-        write_access_log(self, HTTPStatus.OK, "health")
-        json_response(
-            self,
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "service": "stage2_event_receiver",
-                "inbox_dir": str(ReceiverConfig.inbox_dir),
-                "signals_dir": str(ReceiverConfig.signals_dir),
-                "auth_enabled": bool(ReceiverConfig.token),
-                "discord_enabled": ReceiverConfig.discord is not None,
-                "signals_generated": len(ReceiverConfig.signal_state.signals),
-                "trade_date": ReceiverConfig.trade_date,
-                "last_event_utc": ReceiverConfig.last_event_utc.isoformat() if ReceiverConfig.last_event_utc else None,
-                "memory": ReceiverConfig.signal_state.memory_stats(),
-            },
-        )
+        if not is_authorized(self):
+            write_access_log(self, HTTPStatus.OK, "health_public")
+            json_response(self, HTTPStatus.OK, {"ok": True})
+            return
+        write_access_log(self, HTTPStatus.OK, "health_private")
+        json_response(self, HTTPStatus.OK, private_health_payload())
 
     def do_POST(self) -> None:
         if self.path != "/events":
-            write_access_log(self, HTTPStatus.NOT_FOUND, "rejected", "not_found")
-            json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            reject(self, HTTPStatus.NOT_FOUND, "not_found", "not_found")
+            return
+        if bad_request_limited(self) and not is_authorized(self):
+            reject(self, HTTPStatus.TOO_MANY_REQUESTS, "rate_limited", "rate_limited", count_bad=False)
             return
         if unauthorized(self):
             return
 
         content_length = int(self.headers.get("Content-Length", "0") or "0")
         if content_length <= 0:
-            write_access_log(self, HTTPStatus.BAD_REQUEST, "rejected", "empty_body")
-            json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "empty_body"})
+            reject(self, HTTPStatus.BAD_REQUEST, "empty_body", "empty_body")
             return
         if content_length > MAX_BODY_BYTES:
-            write_access_log(
+            reject(
                 self,
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
-                "rejected",
                 "body_too_large",
-                {"content_length": content_length},
+                "body_too_large",
+                extra={"content_length": content_length},
             )
-            json_response(self, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "error": "body_too_large"})
             return
 
         try:
@@ -290,8 +341,13 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
             receipt["signals_total"] = len(ReceiverConfig.signal_state.signals)
             (Path(receipt["event_dir"]) / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
         except Exception as exc:
-            write_access_log(self, HTTPStatus.BAD_REQUEST, "rejected", "processing_error", {"error": str(exc)})
-            json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            reject(
+                self,
+                HTTPStatus.BAD_REQUEST,
+                "bad_event",
+                "processing_error",
+                extra={"error": str(exc)},
+            )
             return
 
         write_access_log(
@@ -349,6 +405,21 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
         return receipt
 
 
+def private_health_payload() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "service": "stage2_event_receiver",
+        "inbox_dir": str(ReceiverConfig.inbox_dir),
+        "signals_dir": str(ReceiverConfig.signals_dir),
+        "auth_enabled": bool(ReceiverConfig.token),
+        "discord_enabled": ReceiverConfig.discord is not None,
+        "signals_generated": len(ReceiverConfig.signal_state.signals),
+        "trade_date": ReceiverConfig.trade_date,
+        "last_event_utc": ReceiverConfig.last_event_utc.isoformat() if ReceiverConfig.last_event_utc else None,
+        "memory": ReceiverConfig.signal_state.memory_stats(),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=Path, default=Path(".env"))
@@ -384,6 +455,8 @@ def main() -> None:
     ReceiverConfig.heartbeat_seconds = args.heartbeat_seconds
     ReceiverConfig.access_log = args.access_log.resolve()
     ReceiverConfig.access_log_lock = threading.Lock()
+    ReceiverConfig.bad_request_lock = threading.Lock()
+    ReceiverConfig.bad_requests_by_ip = {}
     ReceiverConfig.token = args.token
     ReceiverConfig.signal_state = SignalState(load_params(args.param_csv))
     ReceiverConfig.discord = None if args.no_discord else DiscordNotifier.from_env(dry_run=args.dry_run_discord)
