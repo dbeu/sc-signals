@@ -132,6 +132,7 @@ Stage 1 does not compute final signals and does not send Discord messages.
 Stage 2 receives each event and:
 
 - saves it under `/opt/sc_stage2_inbox`
+- logs every request to `/opt/sc_stage2_access.jsonl`
 - detects the event trade date
 - resets in-memory signal state when the trade date changes
 - processes bars/context into signals
@@ -201,11 +202,23 @@ Logs:
 journalctl -u sc-signals -f
 ```
 
+Access log:
+
+```bash
+tail -f /opt/sc_stage2_access.jsonl
+```
+
+Each access-log line is JSON with the request timestamp, client IP, method,
+path, status, and outcome. Accepted `/events` requests also include event name,
+trade date, bytes received, and number of new signals. Unauthorized requests are
+logged with `outcome="rejected"` and `detail="unauthorized"`.
+
 The service uses:
 
 ```text
 /opt/sc_stage2_inbox
 /opt/sc_stage2_signals
+/opt/sc_stage2_access.jsonl
 ```
 
 Retention:
@@ -266,6 +279,8 @@ Known replay checks:
 - Keep the Stage 1 machine awake and online.
 - Rotate the VPS root password if it was shared during setup.
 - Prefer SSH keys over password SSH.
+- Watch `/opt/sc_stage2_access.jsonl` for unexpected client IPs or repeated
+  unauthorized requests.
 - On the first live day, watch logs from `09:20` through at least `09:35 ET`.
 - Live v1 is signal-only. Manual trade review/execution remains outside this
   repo.

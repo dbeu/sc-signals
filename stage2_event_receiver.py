@@ -45,6 +45,8 @@ class ReceiverConfig:
     signal_retention_days: int
     stale_after_seconds: int
     heartbeat_seconds: int
+    access_log: Path
+    access_log_lock: threading.Lock
     token: str
     signal_state: SignalState
     discord: DiscordNotifier | None
@@ -67,6 +69,42 @@ def json_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: 
     handler.wfile.write(body)
 
 
+def client_ip(handler: BaseHTTPRequestHandler) -> str:
+    forwarded_for = handler.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    return handler.client_address[0]
+
+
+def write_access_log(
+    handler: BaseHTTPRequestHandler,
+    status: HTTPStatus,
+    outcome: str,
+    detail: str = "",
+    extra: dict[str, Any] | None = None,
+) -> None:
+    access_log = getattr(ReceiverConfig, "access_log", None)
+    if not access_log:
+        return
+    entry: dict[str, Any] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+        "client_ip": client_ip(handler),
+        "method": handler.command,
+        "path": handler.path,
+        "status": int(status),
+        "outcome": outcome,
+    }
+    if detail:
+        entry["detail"] = detail
+    if extra:
+        entry.update(extra)
+    line = json.dumps(entry, sort_keys=True) + "\n"
+    with ReceiverConfig.access_log_lock:
+        access_log.parent.mkdir(parents=True, exist_ok=True)
+        with access_log.open("a", encoding="utf-8") as file:
+            file.write(line)
+
+
 def unauthorized(handler: BaseHTTPRequestHandler) -> bool:
     token = ReceiverConfig.token
     if not token:
@@ -75,6 +113,7 @@ def unauthorized(handler: BaseHTTPRequestHandler) -> bool:
     if header == f"Bearer {token}":
         return False
     json_response(handler, HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+    write_access_log(handler, HTTPStatus.UNAUTHORIZED, "rejected", "unauthorized")
     return True
 
 
@@ -188,8 +227,10 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path != "/health":
+            write_access_log(self, HTTPStatus.NOT_FOUND, "rejected", "not_found")
             json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return
+        write_access_log(self, HTTPStatus.OK, "health")
         json_response(
             self,
             HTTPStatus.OK,
@@ -209,6 +250,7 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path != "/events":
+            write_access_log(self, HTTPStatus.NOT_FOUND, "rejected", "not_found")
             json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return
         if unauthorized(self):
@@ -216,9 +258,17 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
 
         content_length = int(self.headers.get("Content-Length", "0") or "0")
         if content_length <= 0:
+            write_access_log(self, HTTPStatus.BAD_REQUEST, "rejected", "empty_body")
             json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": "empty_body"})
             return
         if content_length > MAX_BODY_BYTES:
+            write_access_log(
+                self,
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                "rejected",
+                "body_too_large",
+                {"content_length": content_length},
+            )
             json_response(self, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"ok": False, "error": "body_too_large"})
             return
 
@@ -240,9 +290,22 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
             receipt["signals_total"] = len(ReceiverConfig.signal_state.signals)
             (Path(receipt["event_dir"]) / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
         except Exception as exc:
+            write_access_log(self, HTTPStatus.BAD_REQUEST, "rejected", "processing_error", {"error": str(exc)})
             json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             return
 
+        write_access_log(
+            self,
+            HTTPStatus.ACCEPTED,
+            "accepted",
+            extra={
+                "event_name": receipt["event_name"],
+                "source": receipt["source"],
+                "trade_date": receipt["trade_date"],
+                "new_signals": receipt["new_signals"],
+                "total_bytes": receipt["total_bytes"],
+            },
+        )
         json_response(self, HTTPStatus.ACCEPTED, receipt)
 
     def save_event(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -298,6 +361,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--signal-retention-days", type=int, default=90)
     parser.add_argument("--stale-after-seconds", type=int, default=180)
     parser.add_argument("--heartbeat-seconds", type=int, default=30)
+    parser.add_argument("--access-log", type=Path, default=Path("stage2_access.log"))
     parser.add_argument("--token", default=os.environ.get("SC_STAGE1_TOKEN", ""))
     parser.add_argument("--no-discord", action="store_true")
     parser.add_argument("--dry-run-discord", action="store_true")
@@ -318,6 +382,8 @@ def main() -> None:
     ReceiverConfig.signal_retention_days = args.signal_retention_days
     ReceiverConfig.stale_after_seconds = args.stale_after_seconds
     ReceiverConfig.heartbeat_seconds = args.heartbeat_seconds
+    ReceiverConfig.access_log = args.access_log.resolve()
+    ReceiverConfig.access_log_lock = threading.Lock()
     ReceiverConfig.token = args.token
     ReceiverConfig.signal_state = SignalState(load_params(args.param_csv))
     ReceiverConfig.discord = None if args.no_discord else DiscordNotifier.from_env(dry_run=args.dry_run_discord)
@@ -333,7 +399,8 @@ def main() -> None:
         (
             f"Listening on http://{args.host}:{args.port} "
             f"inbox={ReceiverConfig.inbox_dir} signals={ReceiverConfig.signals_dir} "
-            f"auth={bool(args.token)} discord={ReceiverConfig.discord is not None}"
+            f"auth={bool(args.token)} discord={ReceiverConfig.discord is not None} "
+            f"access_log={ReceiverConfig.access_log}"
         ),
         flush=True,
     )
