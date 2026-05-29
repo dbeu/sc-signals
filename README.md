@@ -108,3 +108,53 @@ pm_selloff = open / premarket_high - 1
 
 So `pm_selloff` is negative when the regular-session open is below the
 premarket high.
+
+## Production Schedule
+
+Live v1 Stage 1 should run on market days with this window:
+
+- Start posting: `09:31:00` ET. The 09:30 opening minute is usually available
+  after the minute closes.
+- Stop posting: `14:05:00` ET. The deployed strategies do not need later data:
+  GO/D2O fire at open, GE is morning, RE is midday, and D2E uses the
+  `before_1400` window.
+- Poll interval: `60` seconds.
+- Local Stage 1 retention: `7` days.
+- VPS event retention: `14` days.
+- VPS signal retention: `90` days.
+
+Run the production Stage 1 loop from the machine with Polygon/Massive access:
+
+```bash
+python3 stage1_polygon_fetcher.py \
+  --loop \
+  --out-dir stage1_events \
+  --post-url http://45.76.19.162:8080/events \
+  --start-time 09:31:00 \
+  --stop-time 14:05:00 \
+  --poll-seconds 60 \
+  --reference-limit 0
+```
+
+`--reference-limit 0` means fetch all active US stock reference pages once at
+startup. Stage 1 then polls the all-market snapshot endpoint once per cycle,
+routes likely tickers, fetches minute bars only for routed/active tickers, and
+posts each event cycle to Stage 2.
+
+## Systemd
+
+Install the VPS receiver as a service:
+
+```bash
+cp deploy/sc-signals.service /etc/systemd/system/sc-signals.service
+systemctl daemon-reload
+systemctl enable sc-signals
+systemctl start sc-signals
+systemctl status sc-signals
+```
+
+Logs:
+
+```bash
+journalctl -u sc-signals -f
+```

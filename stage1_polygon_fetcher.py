@@ -10,9 +10,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -28,6 +33,7 @@ from common import (
     likely_non_common,
 )
 from stage1_polygon_api_probe import (
+    BASE_URL,
     DEFAULT_ENV,
     fetch_grouped_daily,
     fetch_minute_aggs,
@@ -49,6 +55,11 @@ class RouteThresholds:
     ge_pm_high_ext_min: float
     ge_pm_selloff_max: float
     d2_prev_high_open_min: float
+    go_gap_min: float
+    go_gap_max: float
+    go_pm_selloff_min: float
+    go_pm_selloff_max: float
+    go_min_pm_dollar_volume: float
 
 
 def parse_tickers(value: str) -> list[str]:
@@ -180,6 +191,46 @@ def clean_reference_universe(reference: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates("ticker").reset_index(drop=True)
 
 
+def polygon_get_url(url: str, api_key: str, timeout: int = 30) -> dict[str, Any]:
+    separator = "&" if "?" in url else "?"
+    request_url = url if "apiKey=" in url else f"{url}{separator}{urllib.parse.urlencode({'apiKey': api_key})}"
+    with urllib.request.urlopen(request_url, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+        payload["_http_status"] = response.status
+        return payload
+
+
+def fetch_reference_universe(api_key: str, limit: int = 0) -> pd.DataFrame:
+    if limit > 0:
+        return normalize_reference(fetch_reference_tickers(api_key, limit=limit))
+
+    params = urllib.parse.urlencode({"market": "stocks", "active": "true", "limit": 1000, "apiKey": api_key})
+    url = f"{BASE_URL}/v3/reference/tickers?{params}"
+    rows = []
+    page = 0
+    while url:
+        page += 1
+        payload = polygon_get_url(url, api_key)
+        rows.extend(payload.get("results", []))
+        print(f"reference page {page}: total={len(rows):,}", flush=True)
+        url = payload.get("next_url")
+        if url and url.startswith("/"):
+            url = f"{BASE_URL}{url}"
+    return normalize_reference({"results": rows})
+
+
+def fetch_snapshot_frame(api_key: str, tickers: list[str], batch_size: int) -> pd.DataFrame:
+    if not tickers:
+        return normalize_snapshots(fetch_snapshots(api_key, []))
+    frames = []
+    for start in range(0, len(tickers), batch_size):
+        batch = tickers[start : start + batch_size]
+        frame = normalize_snapshots(fetch_snapshots(api_key, batch))
+        if not frame.empty:
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def build_context(prev_daily: pd.DataFrame, snapshots: pd.DataFrame, trade_date: str) -> pd.DataFrame:
     context = prev_daily.merge(snapshots, on="ticker", how="left")
     context["date"] = trade_date
@@ -236,6 +287,7 @@ def route_tickers(context: pd.DataFrame, premarket: pd.DataFrame, thresholds: Ro
     routed["high_open"] = day_high / day_open - 1.0
     routed["pm_high_ext"] = pm_high / prev_close - 1.0
     routed["pm_selloff"] = day_open / pm_high - 1.0
+    routed["pm_dollar_volume"] = day_open * pd.to_numeric(routed["pm_volume"], errors="coerce")
     routed["prev_high_open"] = prev_high / prev_open - 1.0
     routed["route_re"] = routed["high_open"].ge(thresholds.re_route_extension) & day_high.ge(MIN_ENTRY_PRICE)
     routed["route_ge"] = (
@@ -245,8 +297,16 @@ def route_tickers(context: pd.DataFrame, premarket: pd.DataFrame, thresholds: Ro
         & day_high.ge(MIN_ENTRY_PRICE)
     )
     routed["route_d2"] = routed["prev_high_open"].ge(thresholds.d2_prev_high_open_min)
+    routed["route_go"] = (
+        routed["gap"].ge(thresholds.go_gap_min)
+        & routed["gap"].lt(thresholds.go_gap_max)
+        & routed["pm_selloff"].ge(thresholds.go_pm_selloff_min)
+        & routed["pm_selloff"].le(thresholds.go_pm_selloff_max)
+        & routed["pm_dollar_volume"].ge(thresholds.go_min_pm_dollar_volume)
+        & day_high.ge(MIN_ENTRY_PRICE)
+    )
     routed = routed[
-        (routed["route_re"] | routed["route_ge"] | routed["route_d2"])
+        (routed["route_re"] | routed["route_ge"] | routed["route_d2"] | routed["route_go"])
         & day_open.le(MAX_ENTRY_PRICE).fillna(True)
     ].copy()
     return routed.sort_values("ticker").reset_index(drop=True)
@@ -276,6 +336,205 @@ def fetch_bars_for_tickers(api_key: str, tickers: list[str], start_date: str, en
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def parse_hms(value: str) -> tuple[int, int, int]:
+    hour, minute, second = [int(part) for part in value.split(":")]
+    return hour, minute, second
+
+
+def local_day_dir(root: Path, trade_date: str) -> Path:
+    return root / trade_date
+
+
+def cleanup_old_day_dirs(root: Path, retention_days: int) -> None:
+    if retention_days <= 0 or not root.exists():
+        return
+    cutoff = pd.Timestamp.now(tz=ET).normalize() - pd.Timedelta(days=retention_days)
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            child_day = pd.Timestamp(child.name).tz_localize(ET)
+        except Exception:
+            continue
+        if child_day < cutoff:
+            shutil.rmtree(child)
+            print(f"Removed old Stage 1 archive: {child}", flush=True)
+
+
+def sleep_until_next_poll(poll_seconds: int) -> None:
+    now = time.time()
+    delay = poll_seconds - (now % poll_seconds)
+    time.sleep(max(1.0, delay))
+
+
+def preliminary_candidates(context: pd.DataFrame, thresholds: RouteThresholds) -> pd.DataFrame:
+    df = context.copy()
+    prev_open = pd.to_numeric(df["prev_open"], errors="coerce")
+    prev_high = pd.to_numeric(df["prev_high"], errors="coerce")
+    prev_close = pd.to_numeric(df["prev_close"], errors="coerce")
+    day_open = pd.to_numeric(df["day_open"], errors="coerce")
+    day_high = pd.to_numeric(df["day_high"], errors="coerce")
+    df["gap"] = day_open / prev_close - 1.0
+    df["high_open"] = day_high / day_open - 1.0
+    df["prev_high_open"] = prev_high / prev_open - 1.0
+    possible = (
+        df["prev_high_open"].ge(thresholds.d2_prev_high_open_min)
+        | df["high_open"].ge(thresholds.re_route_extension)
+        | df["gap"].ge(min(thresholds.ge_gap_min, thresholds.go_gap_min))
+    )
+    price_ok = day_high.ge(MIN_ENTRY_PRICE) & day_open.le(MAX_ENTRY_PRICE).fillna(True)
+    return df[possible & price_ok].copy()
+
+
+def post_cycle(event_dir: Path, post_url: str, post_token: str, source: str) -> None:
+    if not post_url:
+        return
+    receipt = post_event_dir(event_dir, post_url, token=post_token, source=source)
+    print(
+        f"posted {event_dir.name}: new_signals={receipt.get('new_signals')} total={receipt.get('signals_total')}",
+        flush=True,
+    )
+
+
+def run_loop(args: argparse.Namespace) -> None:
+    load_dotenv(args.env)
+    if not args.post_token:
+        args.post_token = os.environ.get("SC_STAGE1_TOKEN", "")
+    api_key = load_api_key(args.env)
+    trade_date = args.date or datetime.now(ET).date().isoformat()
+    prev_date = args.prev_date or previous_weekday(trade_date)
+    thresholds = RouteThresholds(
+        re_route_extension=args.re_route_extension,
+        ge_gap_min=args.ge_gap_min,
+        ge_pm_high_ext_min=args.ge_pm_high_ext_min,
+        ge_pm_selloff_max=args.ge_pm_selloff_max,
+        d2_prev_high_open_min=args.d2_prev_high_open_min,
+        go_gap_min=args.go_gap_min,
+        go_gap_max=args.go_gap_max,
+        go_pm_selloff_min=args.go_pm_selloff_min,
+        go_pm_selloff_max=args.go_pm_selloff_max,
+        go_min_pm_dollar_volume=args.go_min_pm_dollar_volume,
+    )
+
+    cleanup_old_day_dirs(args.out_dir, args.local_retention_days)
+    day_dir = local_day_dir(args.out_dir, trade_date)
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.tickers:
+        universe_tickers = parse_tickers(args.tickers)
+        print(f"Using explicit ticker allowlist: {len(universe_tickers):,}", flush=True)
+    else:
+        print("Fetching reference universe", flush=True)
+        reference = clean_reference_universe(fetch_reference_universe(api_key, limit=args.reference_limit))
+        if args.max_universe and len(reference) > args.max_universe:
+            reference = reference.head(args.max_universe).copy()
+        universe_tickers = reference["ticker"].drop_duplicates().tolist()
+        print(f"Clean reference universe: {len(universe_tickers):,}", flush=True)
+
+    print(f"Fetching grouped daily {prev_date}", flush=True)
+    prev_daily = normalize_grouped_daily(fetch_grouped_daily(api_key, prev_date), prev_date)
+    prev_daily = prev_daily[prev_daily["ticker"].isin(universe_tickers)].copy()
+
+    active_tickers: set[str] = set()
+    d2_prior_loaded: set[str] = set()
+    last_sent_dt: dict[str, pd.Timestamp] = {}
+    cycle_index = 0
+    start_hms = parse_hms(args.start_time)
+    stop_hms = parse_hms(args.stop_time)
+    start_at = pd.Timestamp(datetime.combine(pd.Timestamp(trade_date).date(), datetime.min.time()), tz=ET).replace(
+        hour=start_hms[0], minute=start_hms[1], second=start_hms[2]
+    )
+    stop_at = pd.Timestamp(datetime.combine(pd.Timestamp(trade_date).date(), datetime.min.time()), tz=ET).replace(
+        hour=stop_hms[0], minute=stop_hms[1], second=stop_hms[2]
+    )
+    print(f"Stage 1 live loop window: {start_at.isoformat()} -> {stop_at.isoformat()}", flush=True)
+
+    while True:
+        now_et = pd.Timestamp.now(tz=ET) if not args.date else pd.Timestamp.now(tz=ET)
+        if now_et < start_at:
+            print(f"Waiting for start window: now={now_et.isoformat()}", flush=True)
+            sleep_until_next_poll(args.poll_seconds)
+            continue
+        if now_et > stop_at:
+            print(f"Stop window reached: now={now_et.isoformat()}", flush=True)
+            cleanup_old_day_dirs(args.out_dir, args.local_retention_days)
+            return
+
+        print(f"cycle {cycle_index:04d} {now_et.strftime('%H:%M:%S')} fetching snapshots", flush=True)
+        snapshots = fetch_snapshot_frame(api_key, [] if not args.tickers else universe_tickers, args.snapshot_batch_size)
+        snapshots = snapshots[snapshots["ticker"].isin(universe_tickers)].copy() if not snapshots.empty else snapshots
+        context = build_context(prev_daily, snapshots, trade_date)
+        candidates = preliminary_candidates(context, thresholds)
+        if args.max_active_tickers and len(candidates) > args.max_active_tickers:
+            candidates = candidates.head(args.max_active_tickers).copy()
+        candidate_tickers = candidates["ticker"].drop_duplicates().tolist()
+
+        current_bars = fetch_bars_for_tickers(api_key, candidate_tickers, trade_date, trade_date) if candidate_tickers else pd.DataFrame()
+        if not current_bars.empty:
+            current_bars = current_bars[current_bars["dt"].le(now_et)].copy()
+        premarket = summarize_premarket(current_bars)
+        routed = route_tickers(context[context["ticker"].isin(candidate_tickers)].copy(), premarket, thresholds)
+        routed_tickers = routed["ticker"].drop_duplicates().tolist()
+        new_tickers = [ticker for ticker in routed_tickers if ticker not in active_tickers]
+        active_tickers.update(routed_tickers)
+
+        prior_bars = pd.DataFrame()
+        new_d2 = routed.loc[routed["route_d2"].fillna(False), "ticker"].drop_duplicates().tolist()
+        new_d2 = [ticker for ticker in new_d2 if ticker not in d2_prior_loaded]
+        if new_d2:
+            prior_bars = fetch_bars_for_tickers(api_key, new_d2, prev_date, prev_date)
+            d2_prior_loaded.update(new_d2)
+
+        active_current = pd.DataFrame()
+        if active_tickers:
+            active_current = fetch_bars_for_tickers(api_key, sorted(active_tickers), trade_date, trade_date)
+            if not active_current.empty:
+                active_current = active_current[active_current["dt"].le(now_et)].copy()
+                keep = []
+                for ticker, frame in active_current.groupby("ticker", sort=False):
+                    last_dt = last_sent_dt.get(ticker)
+                    delta = frame if last_dt is None else frame[frame["dt"].gt(last_dt)].copy()
+                    if not delta.empty:
+                        keep.append(delta)
+                        last_sent_dt[ticker] = pd.Timestamp(delta["dt"].max())
+                active_current = pd.concat(keep, ignore_index=True) if keep else pd.DataFrame()
+
+        bars = pd.concat([prior_bars, active_current], ignore_index=True)
+        if not bars.empty:
+            bars = bars[bars["tod"].between(PRE_START, AH_END)].copy()
+        event_context = context[context["ticker"].isin(new_tickers)].copy()
+        if cycle_index == 0:
+            event_context = context[context["ticker"].isin(active_tickers)].copy()
+        if not event_context.empty:
+            event_context = event_context[["ticker", "date", "prev_date", "prev_open", "prev_high", "prev_low", "prev_close", "prev_volume"]]
+
+        label = "seed" if cycle_index == 0 else now_et.strftime("%H%M")
+        event_dir = write_cycle(
+            day_dir,
+            cycle_index,
+            label,
+            now_et,
+            {"universe_context": event_context, "bar_delta": bars},
+            {
+                "trade_date": trade_date,
+                "prev_date": prev_date,
+                "active_tickers": len(active_tickers),
+                "new_tickers": len(new_tickers),
+                "candidate_tickers": len(candidate_tickers),
+                "routed_tickers": len(routed_tickers),
+            },
+        )
+        routed.to_csv(day_dir / f"{cycle_index:04d}_{label}_routed.csv", index=False)
+        post_cycle(event_dir, args.post_url, args.post_token, "stage1_polygon_loop")
+        print(
+            f"cycle {cycle_index:04d}: candidates={len(candidate_tickers):,} active={len(active_tickers):,} "
+            f"new={len(new_tickers):,} bars={len(bars):,}",
+            flush=True,
+        )
+        cycle_index += 1
+        sleep_until_next_poll(args.poll_seconds)
+
+
 def run_seed(args: argparse.Namespace) -> None:
     load_dotenv(args.env)
     if not args.post_token:
@@ -290,6 +549,11 @@ def run_seed(args: argparse.Namespace) -> None:
         ge_pm_high_ext_min=args.ge_pm_high_ext_min,
         ge_pm_selloff_max=args.ge_pm_selloff_max,
         d2_prev_high_open_min=args.d2_prev_high_open_min,
+        go_gap_min=args.go_gap_min,
+        go_gap_max=args.go_gap_max,
+        go_pm_selloff_min=args.go_pm_selloff_min,
+        go_pm_selloff_max=args.go_pm_selloff_max,
+        go_min_pm_dollar_volume=args.go_min_pm_dollar_volume,
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -386,13 +650,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d2-prev-high-open-min", type=float, default=0.20)
     parser.add_argument("--post-url", default="", help="Optional receiver URL, e.g. http://1.2.3.4:8080/events.")
     parser.add_argument("--post-token", default="")
+    parser.add_argument("--loop", action="store_true", help="Run the production polling loop instead of a one-shot seed fetch.")
+    parser.add_argument("--start-time", default="09:31:00")
+    parser.add_argument("--stop-time", default="14:05:00")
+    parser.add_argument("--poll-seconds", type=int, default=60)
+    parser.add_argument("--snapshot-batch-size", type=int, default=500)
+    parser.add_argument("--max-active-tickers", type=int, default=0)
+    parser.add_argument("--local-retention-days", type=int, default=7)
+    parser.add_argument("--go-gap-min", type=float, default=0.80)
+    parser.add_argument("--go-gap-max", type=float, default=9.99)
+    parser.add_argument("--go-pm-selloff-min", type=float, default=-1.0)
+    parser.add_argument("--go-pm-selloff-max", type=float, default=0.0)
+    parser.add_argument("--go-min-pm-dollar-volume", type=float, default=200_000.0)
     parser.set_defaults(func=run_seed)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    args.func(args)
+    if args.loop:
+        run_loop(args)
+    else:
+        args.func(args)
 
 
 if __name__ == "__main__":

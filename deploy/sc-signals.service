@@ -1,0 +1,16 @@
+[Unit]
+Description=SC Signals Stage 2 Receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/sc-signals
+EnvironmentFile=/root/sc-signals/.env
+ExecStart=/root/sc-signals/.venv/bin/python /root/sc-signals/stage2_event_receiver.py --host 0.0.0.0 --port 8080 --inbox-dir /opt/sc_stage2_inbox --signals-dir /opt/sc_stage2_signals --event-retention-days 14 --signal-retention-days 90
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

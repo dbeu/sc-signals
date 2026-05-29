@@ -11,11 +11,14 @@ import argparse
 import base64
 import json
 import os
+import shutil
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+import pandas as pd
 
 from common import DEFAULT_PARAM_CSV
 from discord_notifier import DiscordNotifier, send_signal_notifications
@@ -35,9 +38,13 @@ MAX_BODY_BYTES = 100 * 1024 * 1024
 class ReceiverConfig:
     inbox_dir: Path
     signals_dir: Path
+    param_csv: Path
+    event_retention_days: int
+    signal_retention_days: int
     token: str
     signal_state: SignalState
     discord: DiscordNotifier | None
+    trade_date: str
 
 
 def safe_name(value: str) -> str:
@@ -65,6 +72,54 @@ def unauthorized(handler: BaseHTTPRequestHandler) -> bool:
     return True
 
 
+def cleanup_old_children(root: Path, retention_days: int) -> None:
+    if retention_days <= 0 or not root.exists():
+        return
+    cutoff = datetime.now(timezone.utc).timestamp() - retention_days * 86400
+    for child in root.iterdir():
+        try:
+            mtime = child.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if mtime >= cutoff:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+        print(f"removed old archive: {child}", flush=True)
+
+
+def event_trade_date(event_dir: Path) -> str:
+    manifest_path = event_dir / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("trade_date"):
+            return str(manifest["trade_date"])
+    context_path = event_dir / "universe_context.parquet"
+    if context_path.exists():
+        context = pd.read_parquet(context_path, columns=["date"])
+        if not context.empty:
+            return str(context["date"].iloc[0])
+    bars_path = event_dir / "bar_delta.parquet"
+    if bars_path.exists():
+        bars = pd.read_parquet(bars_path, columns=["date"])
+        if not bars.empty:
+            return str(bars["date"].iloc[-1])
+    return ""
+
+
+def state_for_trade_date(trade_date: str) -> None:
+    if trade_date and trade_date != ReceiverConfig.trade_date:
+        ReceiverConfig.signal_state = SignalState(load_params(ReceiverConfig.param_csv))
+        ReceiverConfig.trade_date = trade_date
+        print(f"reset signal state for trade_date={trade_date}", flush=True)
+
+
+def signals_out_dir(trade_date: str) -> Path:
+    return ReceiverConfig.signals_dir / trade_date if trade_date else ReceiverConfig.signals_dir
+
+
 class Stage2EventHandler(BaseHTTPRequestHandler):
     server_version = "Stage2EventReceiver/0.1"
 
@@ -86,6 +141,7 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
                 "auth_enabled": bool(ReceiverConfig.token),
                 "discord_enabled": ReceiverConfig.discord is not None,
                 "signals_generated": len(ReceiverConfig.signal_state.signals),
+                "trade_date": ReceiverConfig.trade_date,
             },
         )
 
@@ -107,9 +163,14 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
             receipt = self.save_event(payload)
+            trade_date = event_trade_date(Path(receipt["event_dir"]))
+            state_for_trade_date(trade_date)
             new_signals = process_event_dir(ReceiverConfig.signal_state, Path(receipt["event_dir"]))
-            save_signals(ReceiverConfig.signal_state, ReceiverConfig.signals_dir)
+            save_signals(ReceiverConfig.signal_state, signals_out_dir(trade_date))
             send_signal_notifications(ReceiverConfig.discord, new_signals)
+            cleanup_old_children(ReceiverConfig.inbox_dir, ReceiverConfig.event_retention_days)
+            cleanup_old_children(ReceiverConfig.signals_dir, ReceiverConfig.signal_retention_days)
+            receipt["trade_date"] = trade_date
             receipt["new_signals"] = len(new_signals)
             receipt["signals_total"] = len(ReceiverConfig.signal_state.signals)
             (Path(receipt["event_dir"]) / "receipt.json").write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
@@ -168,6 +229,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inbox-dir", type=Path, default=Path("stage2_inbox"))
     parser.add_argument("--signals-dir", type=Path, default=Path("stage2_signals"))
     parser.add_argument("--param-csv", type=Path, default=DEFAULT_PARAM_CSV)
+    parser.add_argument("--event-retention-days", type=int, default=14)
+    parser.add_argument("--signal-retention-days", type=int, default=90)
     parser.add_argument("--token", default=os.environ.get("SC_STAGE1_TOKEN", ""))
     parser.add_argument("--no-discord", action="store_true")
     parser.add_argument("--dry-run-discord", action="store_true")
@@ -183,9 +246,15 @@ def main() -> None:
     ReceiverConfig.inbox_dir.mkdir(parents=True, exist_ok=True)
     ReceiverConfig.signals_dir = args.signals_dir.resolve()
     ReceiverConfig.signals_dir.mkdir(parents=True, exist_ok=True)
+    ReceiverConfig.param_csv = args.param_csv
+    ReceiverConfig.event_retention_days = args.event_retention_days
+    ReceiverConfig.signal_retention_days = args.signal_retention_days
     ReceiverConfig.token = args.token
     ReceiverConfig.signal_state = SignalState(load_params(args.param_csv))
     ReceiverConfig.discord = None if args.no_discord else DiscordNotifier.from_env(dry_run=args.dry_run_discord)
+    ReceiverConfig.trade_date = ""
+    cleanup_old_children(ReceiverConfig.inbox_dir, ReceiverConfig.event_retention_days)
+    cleanup_old_children(ReceiverConfig.signals_dir, ReceiverConfig.signal_retention_days)
 
     server = ThreadingHTTPServer((args.host, args.port), Stage2EventHandler)
     print(
