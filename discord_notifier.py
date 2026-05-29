@@ -63,8 +63,8 @@ def format_signal_line(signal: dict[str, Any]) -> str:
         parts.append(f"ema5ext {float(signal['ema_5_ext']) * 100:.1f}%")
     if "gap" in signal:
         parts.append(f"gap {float(signal['gap']) * 100:.1f}%")
-    if "selloff" in signal:
-        parts.append(f"selloff {float(signal['selloff']) * 100:.1f}%")
+    if "pm_selloff" in signal:
+        parts.append(f"pm_selloff {float(signal['pm_selloff']) * 100:.1f}%")
     return " | ".join(parts)
 
 

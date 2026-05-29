@@ -150,8 +150,8 @@ class SignalState:
             and pd.notna(pm_dollar_volume)
             and gap >= float(params["go_gap_min"])
             and gap < float(params["go_gap_max"])
-            and pm_selloff >= float(params["go_selloff_min"])
-            and pm_selloff < float(params["go_selloff_max"])
+            and pm_selloff >= float(params["go_pm_selloff_ge"])
+            and pm_selloff <= float(params["go_pm_selloff_le"])
             and pm_dollar_volume >= float(params.get("go_min_pm_dollar_volume", 200_000.0))
         ):
             return
@@ -172,7 +172,7 @@ class SignalState:
                 "time": RTH_START,
                 "time_bucket_1h": time_bucket_1h(RTH_START),
                 "gap": gap,
-                "selloff": pm_selloff,
+                "pm_selloff": pm_selloff,
                 "pm_dollar_volume": pm_dollar_volume,
                 "entry_price": entry,
                 "generated_at_et": asof_et.isoformat(),

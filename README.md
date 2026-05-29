@@ -99,3 +99,12 @@ python3 stage2_event_receiver.py \
 If `.env` contains `DISCORD_TOKEN` and `DISCORD_CHANNEL_ID`, the receiver sends
 a Discord batch for every POST that creates new signals. Use
 `--dry-run-discord` to print notification text without sending it.
+
+All strategies use the same premarket selloff convention:
+
+```text
+pm_selloff = open / premarket_high - 1
+```
+
+So `pm_selloff` is negative when the regular-session open is below the
+premarket high.
