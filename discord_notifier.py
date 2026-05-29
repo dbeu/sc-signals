@@ -7,6 +7,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from collections import defaultdict
 from typing import Any
 
 
@@ -51,12 +52,11 @@ class DiscordNotifier:
 
 
 def format_signal_line(signal: dict[str, Any]) -> str:
-    strategy = str(signal.get("strategy", "")).upper()
     ticker = str(signal.get("ticker", "")).upper()
     date = signal.get("date", "")
     time = signal.get("time", "")
     entry = float(signal.get("entry_price", 0.0))
-    parts = [f"`{strategy}` **{ticker}**", f"{date} {time}", f"entry ${entry:.2f}"]
+    parts = [f"**{ticker}**", f"{date} {time}", f"entry ${entry:.2f}"]
     if "extension" in signal:
         parts.append(f"ext {float(signal['extension']) * 100:.1f}%")
     if "ema_5_ext" in signal:
@@ -73,7 +73,16 @@ def format_signal_message(signals: list[dict[str, Any]]) -> str:
         return ""
     asof = signals[-1].get("generated_at_et", "")
     lines = [f"**SC Signals** [{asof}]", ""]
-    lines.extend(format_signal_line(signal) for signal in signals)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for signal in signals:
+        grouped[str(signal.get("strategy", "")).upper()].append(signal)
+    for strategy in sorted(grouped):
+        rows = grouped[strategy]
+        lines.append(f"**{strategy}** ({len(rows)})")
+        lines.extend(f"- {format_signal_line(signal)}" for signal in rows)
+        lines.append("")
+    if lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 
