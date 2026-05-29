@@ -203,6 +203,7 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
                 "signals_generated": len(ReceiverConfig.signal_state.signals),
                 "trade_date": ReceiverConfig.trade_date,
                 "last_event_utc": ReceiverConfig.last_event_utc.isoformat() if ReceiverConfig.last_event_utc else None,
+                "memory": ReceiverConfig.signal_state.memory_stats(),
             },
         )
 
@@ -229,6 +230,7 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
             trade_date = event_trade_date(Path(receipt["event_dir"]))
             state_for_trade_date(trade_date)
             new_signals = process_event_dir(ReceiverConfig.signal_state, Path(receipt["event_dir"]))
+            ReceiverConfig.signal_state.prune_for_trade_date(trade_date)
             save_signals(ReceiverConfig.signal_state, signals_out_dir(trade_date))
             send_signal_notifications(ReceiverConfig.discord, new_signals)
             cleanup_old_children(ReceiverConfig.inbox_dir, ReceiverConfig.event_retention_days)

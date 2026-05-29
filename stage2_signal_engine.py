@@ -72,6 +72,28 @@ class SignalState:
                 continue
             self._process_ticker_date(ticker, str(row["date"]), row, asof_et)
 
+    def prune_for_trade_date(self, trade_date: str) -> None:
+        if trade_date and not self.context.empty:
+            self.context = self.context[self.context["date"].astype(str).eq(str(trade_date))].copy().reset_index(drop=True)
+        if self.context.empty or self.bars.empty:
+            return
+        keep_dates = set(self.context["date"].dropna().astype(str))
+        if "prev_date" in self.context:
+            keep_dates.update(self.context["prev_date"].dropna().astype(str))
+        self.bars = self.bars[self.bars["date"].astype(str).isin(keep_dates)].copy().reset_index(drop=True)
+
+    def memory_stats(self) -> dict:
+        context_mb = float(self.context.memory_usage(deep=True).sum() / 1_000_000) if not self.context.empty else 0.0
+        bars_mb = float(self.bars.memory_usage(deep=True).sum() / 1_000_000) if not self.bars.empty else 0.0
+        return {
+            "context_rows": int(len(self.context)),
+            "bar_rows": int(len(self.bars)),
+            "signals": int(len(self.signals)),
+            "context_mb": round(context_mb, 2),
+            "bars_mb": round(bars_mb, 2),
+            "state_mb": round(context_mb + bars_mb, 2),
+        }
+
     def _day_cache(self, ticker: str, needed_dates: set[str]) -> dict[str, pd.DataFrame]:
         source = self.bars[self.bars["ticker"].eq(ticker) & self.bars["date"].isin(needed_dates)].copy()
         if source.empty:
