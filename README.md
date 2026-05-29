@@ -168,3 +168,8 @@ Logs:
 ```bash
 journalctl -u sc-signals -f
 ```
+
+Stage 2 also watches for missing Stage 1 data during the live window
+(`09:20-14:05 ET`). If no event arrives for `180` seconds, it sends a Discord
+warning. It repeats stale warnings no more often than roughly every five
+minutes while the issue persists.

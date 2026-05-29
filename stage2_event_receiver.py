@@ -12,6 +12,8 @@ import base64
 import json
 import os
 import shutil
+import threading
+import time
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,10 +43,14 @@ class ReceiverConfig:
     param_csv: Path
     event_retention_days: int
     signal_retention_days: int
+    stale_after_seconds: int
+    heartbeat_seconds: int
     token: str
     signal_state: SignalState
     discord: DiscordNotifier | None
     trade_date: str
+    last_event_utc: datetime | None
+    last_stale_alert_utc: datetime | None
 
 
 def safe_name(value: str) -> str:
@@ -120,6 +126,60 @@ def signals_out_dir(trade_date: str) -> Path:
     return ReceiverConfig.signals_dir / trade_date if trade_date else ReceiverConfig.signals_dir
 
 
+def in_expected_stage1_window(now_utc: datetime) -> bool:
+    now_et = pd.Timestamp(now_utc).tz_convert("America/New_York")
+    if now_et.weekday() >= 5:
+        return False
+    tod = now_et.strftime("%H:%M:%S")
+    return "09:20:00" <= tod <= "14:05:00"
+
+
+def start_heartbeat_thread() -> None:
+    thread = threading.Thread(target=heartbeat_loop, name="stage1-heartbeat", daemon=True)
+    thread.start()
+
+
+def heartbeat_loop() -> None:
+    while True:
+        time.sleep(max(5, ReceiverConfig.heartbeat_seconds))
+        try:
+            check_stage1_heartbeat()
+        except Exception as exc:
+            print(f"heartbeat check failed: {exc}", flush=True)
+
+
+def check_stage1_heartbeat() -> None:
+    if ReceiverConfig.discord is None or ReceiverConfig.stale_after_seconds <= 0:
+        return
+    now = datetime.now(timezone.utc)
+    if not in_expected_stage1_window(now):
+        return
+    last_event = ReceiverConfig.last_event_utc
+    if last_event is None:
+        stale_seconds = None
+        is_stale = True
+    else:
+        stale_seconds = (now - last_event).total_seconds()
+        is_stale = stale_seconds > ReceiverConfig.stale_after_seconds
+    if not is_stale:
+        return
+    last_alert = ReceiverConfig.last_stale_alert_utc
+    if last_alert is not None and (now - last_alert).total_seconds() < max(300, ReceiverConfig.stale_after_seconds):
+        return
+    ReceiverConfig.last_stale_alert_utc = now
+    now_et = pd.Timestamp(now).tz_convert("America/New_York").strftime("%H:%M:%S")
+    if stale_seconds is None:
+        message = f"**Stage 1 data stale**\n- No events received yet during live window.\n- Time: {now_et} ET"
+    else:
+        message = (
+            "**Stage 1 data stale**\n"
+            f"- Last event: {int(stale_seconds)}s ago\n"
+            f"- Threshold: {ReceiverConfig.stale_after_seconds}s\n"
+            f"- Time: {now_et} ET"
+        )
+    ReceiverConfig.discord.send_message(message)
+
+
 class Stage2EventHandler(BaseHTTPRequestHandler):
     server_version = "Stage2EventReceiver/0.1"
 
@@ -142,6 +202,7 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
                 "discord_enabled": ReceiverConfig.discord is not None,
                 "signals_generated": len(ReceiverConfig.signal_state.signals),
                 "trade_date": ReceiverConfig.trade_date,
+                "last_event_utc": ReceiverConfig.last_event_utc.isoformat() if ReceiverConfig.last_event_utc else None,
             },
         )
 
@@ -163,6 +224,8 @@ class Stage2EventHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
             receipt = self.save_event(payload)
+            ReceiverConfig.last_event_utc = datetime.now(timezone.utc)
+            ReceiverConfig.last_stale_alert_utc = None
             trade_date = event_trade_date(Path(receipt["event_dir"]))
             state_for_trade_date(trade_date)
             new_signals = process_event_dir(ReceiverConfig.signal_state, Path(receipt["event_dir"]))
@@ -231,6 +294,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--param-csv", type=Path, default=DEFAULT_PARAM_CSV)
     parser.add_argument("--event-retention-days", type=int, default=14)
     parser.add_argument("--signal-retention-days", type=int, default=90)
+    parser.add_argument("--stale-after-seconds", type=int, default=180)
+    parser.add_argument("--heartbeat-seconds", type=int, default=30)
     parser.add_argument("--token", default=os.environ.get("SC_STAGE1_TOKEN", ""))
     parser.add_argument("--no-discord", action="store_true")
     parser.add_argument("--dry-run-discord", action="store_true")
@@ -249,12 +314,17 @@ def main() -> None:
     ReceiverConfig.param_csv = args.param_csv
     ReceiverConfig.event_retention_days = args.event_retention_days
     ReceiverConfig.signal_retention_days = args.signal_retention_days
+    ReceiverConfig.stale_after_seconds = args.stale_after_seconds
+    ReceiverConfig.heartbeat_seconds = args.heartbeat_seconds
     ReceiverConfig.token = args.token
     ReceiverConfig.signal_state = SignalState(load_params(args.param_csv))
     ReceiverConfig.discord = None if args.no_discord else DiscordNotifier.from_env(dry_run=args.dry_run_discord)
     ReceiverConfig.trade_date = ""
+    ReceiverConfig.last_event_utc = None
+    ReceiverConfig.last_stale_alert_utc = None
     cleanup_old_children(ReceiverConfig.inbox_dir, ReceiverConfig.event_retention_days)
     cleanup_old_children(ReceiverConfig.signals_dir, ReceiverConfig.signal_retention_days)
+    start_heartbeat_thread()
 
     server = ThreadingHTTPServer((args.host, args.port), Stage2EventHandler)
     print(
