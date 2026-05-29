@@ -129,6 +129,7 @@ Run the production Stage 1 loop from the machine with Polygon/Massive access:
 ```bash
 python3 stage1_polygon_fetcher.py \
   --loop \
+  --daemon \
   --out-dir stage1_events \
   --post-url http://45.76.19.162:8080/events \
   --start-time 09:20:00 \
@@ -141,6 +142,12 @@ python3 stage1_polygon_fetcher.py \
 startup. Stage 1 then polls the all-market snapshot endpoint once per cycle,
 routes likely tickers, fetches minute bars only for routed/active tickers, and
 posts each event cycle to Stage 2.
+
+With `--daemon`, Stage 1 keeps running across days. Each weekday it rebuilds
+the reference universe and previous-day context for the new trade date, runs
+the `09:20-14:05 ET` loop, cleans old local archives, then sleeps until the
+next day. It uses a weekday check only; exchange holidays should be monitored
+manually for live v1.
 
 Open-entry alerts:
 

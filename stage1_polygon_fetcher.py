@@ -371,6 +371,11 @@ def sleep_until_next_poll(poll_seconds: int) -> None:
     time.sleep(max(1.0, delay))
 
 
+def seconds_until_next_day(now_et: pd.Timestamp, hour: int = 0, minute: int = 5) -> float:
+    next_day = (now_et + pd.Timedelta(days=1)).normalize().replace(hour=hour, minute=minute)
+    return max(60.0, float((next_day - now_et).total_seconds()))
+
+
 def preliminary_candidates(context: pd.DataFrame, thresholds: RouteThresholds) -> pd.DataFrame:
     df = context.copy()
     prev_open = pd.to_numeric(df["prev_open"], errors="coerce")
@@ -570,6 +575,29 @@ def run_loop(args: argparse.Namespace) -> None:
         sleep_until_next_poll(args.poll_seconds)
 
 
+def run_daemon(args: argparse.Namespace) -> None:
+    original_date = args.date
+    while True:
+        now_et = pd.Timestamp.now(tz=ET)
+        if original_date:
+            args.date = original_date
+            run_loop(args)
+            return
+        if now_et.weekday() >= 5:
+            sleep_seconds = min(seconds_until_next_day(now_et), 3600.0)
+            print(f"Weekend/off day wait: now={now_et.isoformat()} sleeping={sleep_seconds:.0f}s", flush=True)
+            time.sleep(sleep_seconds)
+            continue
+        args.date = now_et.date().isoformat()
+        print(f"Starting Stage 1 day loop for {args.date}", flush=True)
+        run_loop(args)
+        args.date = ""
+        now_et = pd.Timestamp.now(tz=ET)
+        sleep_seconds = seconds_until_next_day(now_et)
+        print(f"Stage 1 day complete. Sleeping until next day check: {sleep_seconds:.0f}s", flush=True)
+        time.sleep(sleep_seconds)
+
+
 def run_seed(args: argparse.Namespace) -> None:
     load_dotenv(args.env)
     if not args.post_token:
@@ -686,6 +714,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--post-url", default="", help="Optional receiver URL, e.g. http://1.2.3.4:8080/events.")
     parser.add_argument("--post-token", default="")
     parser.add_argument("--loop", action="store_true", help="Run the production polling loop instead of a one-shot seed fetch.")
+    parser.add_argument("--daemon", action="store_true", help="Keep running across days. Requires --loop.")
     parser.add_argument("--start-time", default="09:20:00")
     parser.add_argument("--stop-time", default="14:05:00")
     parser.add_argument("--poll-seconds", type=int, default=60)
@@ -703,7 +732,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.loop:
+    if args.daemon:
+        if not args.loop:
+            raise SystemExit("--daemon requires --loop")
+        run_daemon(args)
+    elif args.loop:
         run_loop(args)
     else:
         args.func(args)
